@@ -4,14 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>YouTube 라이브 멀티뷰</title>
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-5QZYKV7F0P"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-  gtag('config', 'G-5QZYKV7F0P');
-</script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -187,9 +179,12 @@ input::placeholder{color:var(--text-muted)}
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script>
+// ════════════════════════════════════════
+// ★ 설정
+// ════════════════════════════════════════
 const CHANNEL_KEY  = 'liveview';
 const ADMIN_EMAIL  = 'yhevermore@gmail.com';
-const PROMO_POSITION = 3;
+const PROMO_POSITION = 3; // 홍보카드 위치 (3번째)
 
 const PROMO = {
   name: 'iRumaDory',
@@ -208,21 +203,104 @@ const firebaseConfig = {
   appId: "1:49810815057:web:97f8c2cf99d5a7564ba070"
 };
 
+// ════════════════════════════════════════
+// Firebase 초기화
+// ════════════════════════════════════════
 firebase.initializeApp(firebaseConfig);
 const db   = firebase.database();
 const auth = firebase.auth();
 const settingsRef = db.ref(`settings/${CHANNEL_KEY}`);
 
+// ════════════════════════════════════════
+// 상태
+// ════════════════════════════════════════
 let isAdmin    = false;
-let settings   = { keywords: ['잠실', '부정선거'], maxResults: 20, refreshMin: 10 };
+let settings   = { keywords: ['잠실', '부정선거'], maxResults: 20, refreshMin: 30 };
 let rankData   = [];
 let lastUpdate = null;
 let autoTimer  = null;
 
+// ════════════════════════════════════════
+// Firebase 인증
+// ════════════════════════════════════════
 auth.onAuthStateChanged(user => {
   isAdmin = !!(user && user.email === ADMIN_EMAIL);
 });
 
+// ════════════════════════════════════════
+// 검색 결과 캐시 — Firebase 공유 (30분 TTL)
+// liverank·stockrank 간 API 중복 호출 방지
+// ════════════════════════════════════════
+class SearchCache {
+  static TTL_MS         = 30 * 60 * 1000;
+  static FETCH_STALE_MS = 20 * 1000;  // fetching 플래그 stale 기준 (탭 크래시 대비)
+  static FETCH_WAIT_MS  = 25 * 1000;  // 대기 루프 최대 시간 — FETCH_STALE_MS보다 반드시 길게 설정해야 stale 감지가 백스톱보다 먼저 작동함
+  static POLL_MS        = 1000;       // 폴링 간격
+
+  // Firebase key 금지 문자(.#$[]/ 및 공백) → 밑줄
+  static _safeKey(keyword) {
+    return keyword.replace(/[.#$[\]\s/]/g, '_');
+  }
+
+  static _ref(keyword) {
+    const windowId = Math.floor(Date.now() / this.TTL_MS);
+    return db.ref(`cache/${this._safeKey(keyword)}_${windowId}`);
+  }
+
+  // null → 캐시 없음(또는 stale) | 'fetching' → 진행 중 | object → 유효 데이터
+  static async get(keyword) {
+    const snap = await this._ref(keyword).once('value');
+    const entry = snap.val();
+    if (!entry) return null;
+    if (entry.fetching && !entry.data) {
+      const age = Date.now() - (entry.fetchingAt || 0);
+      if (age > this.FETCH_STALE_MS) {
+        console.warn(`[Stale fetching] ${keyword} — ${Math.round(age/1000)}초 경과, stale 처리`);
+        return null;  // stale 플래그 무시 → 호출자가 직접 API 호출
+      }
+      return 'fetching';
+    }
+    return entry.data || null;
+  }
+
+  static async set(keyword, data) {
+    await this._ref(keyword).set({ fetching: false, data });
+  }
+
+  static async setFetching(keyword) {
+    // fetchingAt 타임스탬프 포함 → stale 감지에 사용
+    await this._ref(keyword).set({ fetching: true, fetchingAt: Date.now(), data: null });
+  }
+}
+
+// ════════════════════════════════════════
+// 시청자 수 캐시 및 ETag 관리
+// ════════════════════════════════════════
+class VideoStatsCache {
+  static etagMap = {};      // videoIds -> ETag 저장
+  static dataMap = {};      // videoIds -> 캐시된 데이터 저장
+  
+  static getETag(videoIds) {
+    return this.etagMap[videoIds];
+  }
+  
+  static setETag(videoIds, etag) {
+    this.etagMap[videoIds] = etag;
+  }
+  
+  static getData(videoIds) {
+    return this.dataMap[videoIds];
+  }
+  
+  static setData(videoIds, data, etag) {
+    this.dataMap[videoIds] = data;
+    if (etag) this.etagMap[videoIds] = etag;
+  }
+}
+
+// ════════════════════════════════════════
+// Firebase 설정 리스닝
+// ════════════════════════════════════════
 settingsRef.on('value', snap => {
   const data = snap.val();
   if (data) settings = data;
@@ -230,11 +308,17 @@ settingsRef.on('value', snap => {
   if (!rankData.length) fetchRanking();
 });
 
+// ════════════════════════════════════════
+// 앱 렌더
+// ════════════════════════════════════════
 function renderApp() {
   document.getElementById('app').innerHTML = isAdmin ? buildAdmin() : buildViewer();
   isAdmin ? initAdmin() : initViewer();
 }
 
+// ════════════════════════════════════════
+// 방문자 화면
+// ════════════════════════════════════════
 function buildViewer() {
   const kw = (settings.keywords || []).join(', ');
   return `
@@ -276,6 +360,7 @@ function renderRanking(items) {
     return;
   }
 
+  // 홍보 카드 HTML
   const promoHTML = `
     <div class="promo-card" onclick="window.open('${PROMO.url}','_blank')">
       <img src="${PROMO.img}" class="promo-img" alt="${PROMO.name}">
@@ -290,9 +375,12 @@ function renderRanking(items) {
   let rankNum = 1;
 
   items.forEach((item, idx) => {
+    // 3번째 위치에 홍보 카드 삽입
     if (idx === PROMO_POSITION - 1) html += promoHTML;
+
     const numClass = rankNum === 1 ? 'top1' : rankNum === 2 ? 'top2' : rankNum === 3 ? 'top3' : '';
     const viewers = item.viewers ? Number(item.viewers).toLocaleString() : '집계 중';
+
     html += `
       <div class="rank-card" onclick="window.open('https://www.youtube.com/watch?v=${item.videoId}','_blank')">
         <div class="rank-num ${numClass}">${rankNum}</div>
@@ -310,19 +398,26 @@ function renderRanking(items) {
     rankNum++;
   });
 
+  // 홍보카드가 아직 삽입 안됐으면 맨 끝에 추가
   if (items.length < PROMO_POSITION) html += promoHTML;
+
   wrap.innerHTML = html;
 
+  // 카운트 업데이트
   const liveEl = document.getElementById('liveCount');
   const hCount = document.getElementById('hCount');
   if (liveEl) liveEl.textContent = `● ${items.length}`;
   if (hCount) hCount.textContent = `총 ${items.length}개`;
 
+  // 업데이트 시간
   lastUpdate = new Date();
   const timeEl = document.getElementById('updateTime');
   if (timeEl) timeEl.textContent = `업데이트: ${lastUpdate.toLocaleTimeString('ko-KR', {hour:'2-digit',minute:'2-digit'})}`;
 }
 
+// ════════════════════════════════════════
+// 랭킹 데이터 가져오기
+// ════════════════════════════════════════
 async function fetchRanking() {
   const apiKey = sessionStorage.getItem('lv_api');
   if (!apiKey) {
@@ -335,15 +430,45 @@ async function fetchRanking() {
   const maxResults = settings.maxResults || 20;
 
   try {
-    const searchPromises = keywords.map(kw =>
-      fetch(`https://www.googleapis.com/youtube/v3/search?${new URLSearchParams({
+    // 1단계: 키워드별 라이브 검색 (Firebase 공유 캐시)
+    const searchPromises = keywords.map(async kw => {
+      let cached = await SearchCache.get(kw);
+
+      if (cached === 'fetching') {
+        // 다른 탭이 API 호출 중 — 결과 또는 stale 감지까지 대기
+        console.log(`[대기] ${kw} — 다른 탭이 API 호출 중`);
+        const deadline = Date.now() + SearchCache.FETCH_WAIT_MS;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, SearchCache.POLL_MS));
+          cached = await SearchCache.get(kw);
+          if (cached !== 'fetching') break;  // 유효 데이터 또는 null(stale) 모두 탈출
+        }
+        if (cached === 'fetching') {
+          // 백스톱: 15초 넘도록 데이터 미도착 → 직접 호출
+          console.warn(`[대기 타임아웃] ${kw} — ${SearchCache.FETCH_WAIT_MS/1000}초 초과, 직접 API 호출`);
+        }
+      }
+
+      if (cached && cached !== 'fetching') {
+        console.log(`[Firebase 캐시 히트] ${kw}`);
+        return cached;
+      }
+
+      // 캐시 미스 / stale / 타임아웃 — fetching 플래그 선점 후 API 호출
+      await SearchCache.setFetching(kw);
+      console.log(`[API 호출] ${kw}`);
+      const res = await fetch(`https://www.googleapis.com/youtube/v3/search?${new URLSearchParams({
         part:'snippet', q:kw, type:'video', eventType:'live',
         maxResults: Math.ceil(maxResults / keywords.length),
         key:apiKey, relevanceLanguage:'ko', order:'viewCount'
-      })}`).then(r=>r.json())
-    );
+      })}`);
+      const data = await res.json();
+      await SearchCache.set(kw, data);
+      return data;
+    });
     const searchResults = await Promise.all(searchPromises);
 
+    // 영상 목록 합치기 (중복 제거)
     const videoMap = new Map();
     searchResults.forEach(result => {
       (result.items || []).forEach(item => {
@@ -362,11 +487,28 @@ async function fetchRanking() {
 
     if (!videoMap.size) { renderRanking([]); return; }
 
+    // 2단계: 시청자 수 가져오기 (ETag 기반 조건부 요청)
     const videoIds = [...videoMap.keys()].join(',');
+    const headers = {};
+    const existingETag = VideoStatsCache.getETag(videoIds);
+    if (existingETag) {
+      headers['If-None-Match'] = existingETag;
+    }
+    
     const statsRes = await fetch(`https://www.googleapis.com/youtube/v3/videos?${new URLSearchParams({
       part:'liveStreamingDetails', id:videoIds, key:apiKey
-    })}`);
-    const statsData = await statsRes.json();
+    })}`, { headers });
+    
+    let statsData;
+    if (statsRes.status === 304) {
+      console.log('[304 Not Modified] 캐시된 데이터 사용 (Quota: 0 units)');
+      statsData = VideoStatsCache.getData(videoIds);
+    } else {
+      const etag = statsRes.headers.get('ETag');
+      statsData = await statsRes.json();
+      VideoStatsCache.setData(videoIds, statsData, etag);
+      console.log(`[API 호출] 새 시청자 수 데이터 조회 및 ETag 저장`);
+    }
 
     (statsData.items || []).forEach(item => {
       const v = videoMap.get(item.id);
@@ -375,6 +517,7 @@ async function fetchRanking() {
       }
     });
 
+    // 시청자 수 순 정렬
     rankData = [...videoMap.values()].sort((a,b) => b.viewers - a.viewers);
     renderRanking(rankData);
 
@@ -390,6 +533,9 @@ function startAutoRefresh() {
   autoTimer = setInterval(fetchRanking, min * 60 * 1000);
 }
 
+// ════════════════════════════════════════
+// 관리자 화면
+// ════════════════════════════════════════
 function buildAdmin() {
   const kws = (settings.keywords || []);
   return `
@@ -416,11 +562,14 @@ function buildAdmin() {
           ✅ Firebase 연동됨<br>
           설정 저장 → 즉시 방문자에게 반영
         </div>
+
         <div class="field-group">
           <span class="field-label">API KEY</span>
           <input type="password" id="apiKeyInput" placeholder="YouTube Data API v3 키" value="${sessionStorage.getItem('lv_api')||''}">
         </div>
+
         <div class="divider"></div>
+
         <div class="field-group">
           <span class="field-label">검색 키워드</span>
           <div class="keyword-list" id="kwList">
@@ -431,17 +580,20 @@ function buildAdmin() {
               </div>`).join('')}
           </div>
           <div class="kw-add-row">
-            <input type="text" id="kwInput" placeholder="키워드 추가" onkeydown="if(event.key==='Enter')addKeyword()">
+            <input type="text" id="kwInput" placeholder="키워드 추가 (예: 잠실)" onkeydown="if(event.key==='Enter')addKeyword()">
             <button class="btn btn-red btn-sm" onclick="addKeyword()">추가</button>
           </div>
         </div>
+
         <div class="divider"></div>
+
         <div class="field-group">
           <span class="field-label">최대 표시 개수</span>
           <select id="maxResults">
             ${[10,20,30,50].map(n=>`<option value="${n}" ${settings.maxResults==n?'selected':''}>${n}개</option>`).join('')}
           </select>
         </div>
+
         <div class="field-group">
           <span class="field-label">자동 갱신 주기</span>
           <select id="refreshMin">
@@ -493,16 +645,21 @@ function renderKeywordList() {
 function saveSettings() {
   const apiKey = document.getElementById('apiKeyInput').value.trim();
   if (apiKey) sessionStorage.setItem('lv_api', apiKey);
+
   settings = {
     keywords:   tempKeywords,
     maxResults: parseInt(document.getElementById('maxResults').value),
     refreshMin: parseInt(document.getElementById('refreshMin').value)
   };
+
   settingsRef.set(settings)
-    .then(() => { toast('✅ 설정 저장 완료!'); fetchRanking(); })
+    .then(() => { toast('✅ 설정 저장 완료! 즉시 반영됩니다.'); fetchRanking(); })
     .catch(err => toast(`❌ 저장 실패: ${err.message}`));
 }
 
+// ════════════════════════════════════════
+// 로그인 모달
+// ════════════════════════════════════════
 function showLoginModal() {
   if (auth.currentUser && auth.currentUser.email === ADMIN_EMAIL) { isAdmin=true; renderApp(); return; }
   const modal = document.createElement('div');
@@ -543,6 +700,9 @@ function doLogout() {
   auth.signOut().then(() => { isAdmin=false; renderApp(); toast('로그아웃 완료'); });
 }
 
+// ════════════════════════════════════════
+// 헬퍼
+// ════════════════════════════════════════
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 let _tt;
 function toast(msg){const el=document.getElementById('toast');el.textContent=msg;el.classList.add('show');clearTimeout(_tt);_tt=setTimeout(()=>el.classList.remove('show'),2800)}
